@@ -1,0 +1,34 @@
+package com.marketplace.catalog.infrastructure.kafka.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.util.UUID;
+
+/**
+ * Incoming Kafka message shape for inventory.updated events.
+ */
+@Getter
+@Setter
+@NoArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class InventoryEventDto {
+
+    private String eventId;
+    private String eventType;
+    private String timestamp;
+    private InventoryPayload payload;
+
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class InventoryPayload {
+        private UUID productId;
+        private Integer availableQuantity;
+        private Integer reservedQuantity;
+        private Boolean inStock;
+    }
+}
