@@ -33,18 +33,26 @@ public class CatalogProductController {
 
     private final CatalogProductService catalogProductService;
 
-    @Operation(summary = "Browse all active products, paginated")
+    @Operation(summary = "Browse active products with optional filters, paginated")
     @GetMapping
     public ApiResponseDto<PagedResponseDto<ProductSummaryDto>> browseProducts(
             @Parameter(description = "Page number, 1-indexed") @RequestParam(defaultValue = "1") int page,
             @Parameter(description = "Page size") @RequestParam(defaultValue = "20") int size,
-            @Parameter(description = "Sort field: name, price, averageRating, createdAt")
-            @RequestParam(defaultValue = "createdAt") String sortBy,
-            @Parameter(description = "Sort direction: asc or desc") @RequestParam(defaultValue = "desc") String direction,
+            @Parameter(description = "Sort: price_asc, price_desc, newest, rating — or a field name")
+            @RequestParam(defaultValue = "newest") String sortBy,
+            @Parameter(description = "Sort direction: asc or desc (used with a field name)")
+            @RequestParam(defaultValue = "desc") String direction,
+            @Parameter(description = "Keyword search over name and brand")
+            @RequestParam(required = false) String search,
+            @RequestParam(required = false) UUID categoryId,
+            @RequestParam(required = false) String brand,
+            @RequestParam(required = false) BigDecimal minPrice,
+            @RequestParam(required = false) BigDecimal maxPrice,
             HttpServletRequest request
     ) {
         Pageable pageable = buildPageable(page, size, sortBy, direction);
-        PagedResponseDto<ProductSummaryDto> result = catalogProductService.browseProducts(pageable);
+        PagedResponseDto<ProductSummaryDto> result = catalogProductService.browseProducts(
+                search, categoryId, brand, minPrice, maxPrice, pageable);
         return ApiResponseDto.success(result, "Success", request.getRequestURI());
     }
 
@@ -145,14 +153,39 @@ public class CatalogProductController {
         return ApiResponseDto.success(result, "Success", request.getRequestURI());
     }
 
+    /** Sortable entity fields the client is allowed to sort by. */
+    private static final java.util.Set<String> SORTABLE_FIELDS =
+            java.util.Set.of("name", "price", "averageRating", "createdAt");
+
     /**
      * Builds a Pageable with 1-indexed page numbers (client-facing) converted
-     * to Spring's 0-indexed internal pages, plus optional sorting.
+     * to Spring's 0-indexed internal pages, plus safe sorting.
      */
     private Pageable buildPageable(int page, int size, String sortBy, String direction) {
-        Sort.Direction dir = "asc".equalsIgnoreCase(direction) ? Sort.Direction.ASC : Sort.Direction.DESC;
-        int zeroIndexedPage = Math.max(page - 1, 0);
-        return PageRequest.of(zeroIndexedPage, clampSize(size), Sort.by(dir, sortBy));
+        return PageRequest.of(Math.max(page - 1, 0), clampSize(size), resolveSort(sortBy, direction));
+    }
+
+    /**
+     * Resolves a sort instruction from either a combined token
+     * (price_asc, price_desc, newest, rating) or a field name + direction.
+     * Falls back to newest-first for anything unrecognised, so a bad value
+     * never throws a 500.
+     */
+    private Sort resolveSort(String sortBy, String direction) {
+        if (sortBy != null) {
+            switch (sortBy) {
+                case "price_asc":  return Sort.by(Sort.Direction.ASC, "price");
+                case "price_desc": return Sort.by(Sort.Direction.DESC, "price");
+                case "newest":     return Sort.by(Sort.Direction.DESC, "createdAt");
+                case "rating":     return Sort.by(Sort.Direction.DESC, "averageRating");
+                default: break;
+            }
+        }
+        if (sortBy != null && SORTABLE_FIELDS.contains(sortBy)) {
+            Sort.Direction dir = "asc".equalsIgnoreCase(direction) ? Sort.Direction.ASC : Sort.Direction.DESC;
+            return Sort.by(dir, sortBy);
+        }
+        return Sort.by(Sort.Direction.DESC, "createdAt");
     }
 
     /**

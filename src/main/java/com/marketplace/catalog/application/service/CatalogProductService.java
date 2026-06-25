@@ -5,13 +5,16 @@ import com.marketplace.catalog.application.dto.ProductDetailDto;
 import com.marketplace.catalog.application.dto.ProductSummaryDto;
 import com.marketplace.catalog.domain.model.CatalogCategory;
 import com.marketplace.catalog.domain.model.CatalogProduct;
+import com.marketplace.catalog.domain.model.PendingStock;
 import com.marketplace.catalog.domain.repository.CatalogCategoryRepository;
 import com.marketplace.catalog.domain.repository.CatalogProductRepository;
+import com.marketplace.catalog.domain.repository.PendingStockRepository;
 import com.marketplace.catalog.infrastructure.kafka.dto.ProductEventDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -40,6 +43,7 @@ public class CatalogProductService {
 
     private final CatalogProductRepository productRepository;
     private final CatalogCategoryRepository categoryRepository;
+    private final PendingStockRepository pendingStockRepository;
 
     // -----------------------------------------------------------------
     // Kafka event handlers (write side of CQRS)
@@ -52,6 +56,14 @@ public class CatalogProductService {
      */
     @Transactional
     public void upsertProduct(ProductEventDto.ProductPayload payload) {
+        // The catalog_products table has a FK to catalog_categories. If the
+        // product's category event hasn't been received yet, inserting the
+        // product would violate that FK and the event would be dropped — making
+        // the product invisible to customers. Self-heal by creating a placeholder
+        // category; the real category.created/updated event upserts it by id
+        // later and corrects the name.
+        ensureCategoryExists(payload.getCategoryId());
+
         CatalogProduct product = productRepository.findById(payload.getProductId())
                 .orElse(new CatalogProduct());
 
@@ -80,6 +92,16 @@ public class CatalogProductService {
         }
 
         productRepository.save(product);
+
+        // Apply any stock status that arrived before this product existed.
+        pendingStockRepository.findById(product.getProductId()).ifPresent(pending -> {
+            product.setInStock(pending.getInStock());
+            productRepository.save(product);
+            pendingStockRepository.delete(pending);
+            log.info("Applied buffered stock | productId={} inStock={}",
+                    product.getProductId(), pending.getInStock());
+        });
+
         log.info("Upserted catalog product | productId={} name={}", product.getProductId(), product.getName());
     }
 
@@ -103,13 +125,27 @@ public class CatalogProductService {
      */
     @Transactional
     public void updateStockStatus(UUID productId, Boolean inStock) {
+        boolean resolvedInStock = Boolean.TRUE.equals(inStock);
         productRepository.findById(productId).ifPresentOrElse(
                 product -> {
-                    product.setInStock(inStock);
+                    product.setInStock(resolvedInStock);
                     productRepository.save(product);
-                    log.info("Updated stock status | productId={} inStock={}", productId, inStock);
+                    if (pendingStockRepository.existsById(productId)) {
+                        pendingStockRepository.deleteById(productId);
+                    }
+                    log.info("Updated stock status | productId={} inStock={}", productId, resolvedInStock);
                 },
-                () -> log.warn("Received inventory update for unknown product | productId={}", productId)
+                () -> {
+                    // Product not in the read model yet — buffer the status so it's
+                    // applied when the product.created event is processed. This makes
+                    // stock sync independent of cross-topic event ordering.
+                    pendingStockRepository.save(PendingStock.builder()
+                            .productId(productId)
+                            .inStock(resolvedInStock)
+                            .build());
+                    log.info("Buffered stock status for not-yet-known product | productId={} inStock={}",
+                            productId, resolvedInStock);
+                }
         );
     }
 
@@ -141,6 +177,45 @@ public class CatalogProductService {
     @Transactional(readOnly = true)
     public PagedResponseDto<ProductSummaryDto> browseProducts(Pageable pageable) {
         Page<CatalogProduct> page = productRepository.findByStatus(STATUS_ACTIVE, pageable);
+        return PagedResponseDto.from(page.map(this::toSummaryDto));
+    }
+
+    /**
+     * Browse active products with optional combined filters (search, category,
+     * brand, price range), paginated and sorted. Any null/blank filter is
+     * ignored, so this also serves the plain "browse all" case.
+     */
+    @Transactional(readOnly = true)
+    public PagedResponseDto<ProductSummaryDto> browseProducts(
+            String search, UUID categoryId, String brand,
+            BigDecimal minPrice, BigDecimal maxPrice, Pageable pageable) {
+
+        Specification<CatalogProduct> spec =
+                (root, query, cb) -> cb.equal(root.get("status"), STATUS_ACTIVE);
+
+        if (categoryId != null) {
+            spec = spec.and((root, query, cb) -> cb.equal(root.get("categoryId"), categoryId));
+        }
+        if (brand != null && !brand.isBlank()) {
+            spec = spec.and((root, query, cb) ->
+                    cb.equal(cb.lower(root.get("brand")), brand.toLowerCase()));
+        }
+        if (minPrice != null) {
+            spec = spec.and((root, query, cb) ->
+                    cb.greaterThanOrEqualTo(root.get("price"), minPrice));
+        }
+        if (maxPrice != null) {
+            spec = spec.and((root, query, cb) ->
+                    cb.lessThanOrEqualTo(root.get("price"), maxPrice));
+        }
+        if (search != null && !search.isBlank()) {
+            String like = "%" + search.toLowerCase().trim() + "%";
+            spec = spec.and((root, query, cb) -> cb.or(
+                    cb.like(cb.lower(root.get("name")), like),
+                    cb.like(cb.lower(root.get("brand")), like)));
+        }
+
+        Page<CatalogProduct> page = productRepository.findAll(spec, pageable);
         return PagedResponseDto.from(page.map(this::toSummaryDto));
     }
 
@@ -221,6 +296,25 @@ public class CatalogProductService {
     // -----------------------------------------------------------------
     // Mapping helpers
     // -----------------------------------------------------------------
+
+    /**
+     * Ensures a category row exists for the given id so product inserts don't
+     * fail the foreign-key constraint when the category event hasn't arrived
+     * yet. Creates a minimal placeholder that a later category event corrects.
+     */
+    private void ensureCategoryExists(UUID categoryId) {
+        if (categoryId == null || categoryRepository.existsById(categoryId)) {
+            return;
+        }
+        CatalogCategory placeholder = CatalogCategory.builder()
+                .categoryId(categoryId)
+                .name("Uncategorized")
+                .slug("category-" + categoryId.toString().substring(0, 8))
+                .isActive(true)
+                .build();
+        categoryRepository.save(placeholder);
+        log.warn("Auto-created placeholder category {} — category event not yet received.", categoryId);
+    }
 
     private ProductSummaryDto toSummaryDto(CatalogProduct product) {
         return ProductSummaryDto.builder()

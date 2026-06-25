@@ -4,6 +4,7 @@ import com.marketplace.catalog.domain.model.CatalogProduct;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -18,7 +19,9 @@ import java.util.UUID;
  *
  * Equivalent to Django: Product.objects.filter(...) / .get(...)
  */
-public interface CatalogProductRepository extends JpaRepository<CatalogProduct, UUID> {
+public interface CatalogProductRepository
+        extends JpaRepository<CatalogProduct, UUID>,
+                JpaSpecificationExecutor<CatalogProduct> {
 
     /**
      * Find a single product by its slug (used for product detail pages).
