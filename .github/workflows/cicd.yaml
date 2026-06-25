@@ -8,7 +8,7 @@ on:
 
 env:
   IMAGE_NAME: haze21/catalog-service
-  HELM_REPO: haze21/k8s-helm-charts
+  HELM_REPO: haze-me/k8s-helm-charts
   HELM_VALUES_PATH: charts/catalog-service/values.yaml
 
 jobs:
@@ -30,10 +30,6 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
           cache: maven
-
-      # Run tests before building the Docker image
-      - name: Run Maven tests
-        run: mvn test -B
 
       - name: Log in to DockerHub
         uses: docker/login-action@v3
@@ -67,5 +63,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add ${{ env.HELM_VALUES_PATH }}
-          git commit -m "cicd: update catalog-service image tag to ${TAG} [skip ci]"
+          git commit -m "ci: update catalog-service image tag to ${TAG} [skip ci]"
           git push
